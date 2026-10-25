@@ -34,6 +34,7 @@ class FileType(Enum):
     MARKDOWN = 1
     XML = 2
     JSON = 3
+    HTML = 4
 
 
 class FileActionEnum(Enum):
@@ -106,8 +107,8 @@ class YoudaoNotePull(object):
 
     def _get_ydnote_dir_id(self, ydnote_dir) -> Tuple[str, str]:
         """
-        获取指定有道云笔记指定目录 ID
-        :param ydnote_dir: 指定有道云笔记指定目录
+        获取指定有道云笔记目录 ID，支持多层路径
+        :param ydnote_dir: 指定有道云笔记目录，例如 "工作笔记" 或 "工作笔记/项目A"
         :return: dir_id, error_msg
         """
         root_dir_info = self.youdaonote_api.get_root_dir_info_id()
@@ -117,13 +118,27 @@ class YoudaoNotePull(object):
         if not ydnote_dir:
             return root_dir_id, ""
 
-        dir_info = self.youdaonote_api.get_dir_info_by_id(root_dir_id)
-        for entry in dir_info["entries"]:
-            file_entry = entry["fileEntry"]
-            if file_entry["name"] == ydnote_dir:
-                return file_entry["id"], ""
+        # 按 / 拆分路径，例如 "工作笔记/项目A" -> ["工作笔记", "项目A"]
+        path_parts = [p for p in ydnote_dir.split("/") if p]
 
-        return "", "有道云笔记指定顶层目录不存在"
+        current_id = root_dir_id
+
+        for part in path_parts:
+            dir_info = self.youdaonote_api.get_dir_info_by_id(current_id)
+            entries = dir_info.get("entries") or []
+
+            found = False
+            for entry in entries:
+                file_entry = entry.get("fileEntry") or {}
+                if file_entry.get("name") == part and file_entry.get("dir"):
+                    current_id = file_entry["id"]
+                    found = True
+                    break
+
+            if not found:
+                return "", f"有道云笔记指定目录不存在: {ydnote_dir}（在 '{part}' 处未找到对应文件夹）"
+
+        return current_id, ""
 
     def get_ydnote_dir_id(self) -> Tuple[str, str]:
         """
@@ -164,12 +179,35 @@ class YoudaoNotePull(object):
             or youdao_file_suffix == ""
         ):
             response = self.youdaonote_api.get_file_by_id(file_id)
-            # 2、如果文件以 `<?xml` 开头
-            if response.content[:5] == b"<?xml":
+            content = response.content
+            # 去除BOM头（有些文件开头有UTF-8 BOM）
+            if content[:3] == b'\xef\xbb\xbf':
+                content = content[3:]
+            # 2、如果文件以 <?xml 开头
+            if content[:5] == b"<?xml":
                 file_type = FileType.XML
-            # 3、如果文件以 `{` 开头
-            elif response.content.startswith(b'{"'):
+            # 3、如果文件以 {" 开头
+            elif content.startswith(b'{"'):
                 file_type = FileType.JSON
+            # 4、如果文件以 <html 或 <!doctype 开头（HTML格式，2017年前旧笔记）
+            elif content.lower().strip().startswith(b'<html') or content.lower().strip().startswith(b'<!doctype'):
+                file_type = FileType.HTML
+            # 5、如果内容中包含HTML标签（如<br />、<p>、<span>等），当作HTML处理
+            elif re.search(rb'<[^>]+>', content):
+                file_type = FileType.HTML
+            # 6、兜底：如果内容看起来像文本，当作HTML处理（兼容纯文本笔记）
+            else:
+                try:
+                    text = content.decode('utf-8')
+                    printable_ratio = sum(1 for c in text if c.isprintable() or c in '\n\r\t') / max(len(text), 1)
+                    if printable_ratio > 0.5:
+                        logging.info("未识别格式的笔记[{}]，可打印字符比例={:.1%}，当作HTML处理。前100字节: {}".format(
+                            file_id, printable_ratio, content[:100]))
+                        file_type = FileType.HTML
+                    else:
+                        logging.info("未识别格式的笔记[{}]，可能是二进制文件，保留原格式".format(file_id))
+                except (UnicodeDecodeError, ValueError):
+                    logging.info("未识别格式的笔记[{}]，无法解码为UTF-8，保留原格式".format(file_id))
         return file_type
 
     def _get_file_action(self, local_file_path, modify_time) -> Enum:
@@ -333,6 +371,11 @@ class YoudaoNotePull(object):
                 logging.info("note 笔记转换 MarkDown 失败，将跳过", repr(e))
         elif file_type == FileType.JSON:
             YoudaoNoteConvert.covert_json_to_markdown(file_path)
+        elif file_type == FileType.HTML:
+            try:
+                YoudaoNoteConvert.covert_html_to_markdown(file_path)
+            except Exception as e:
+                logging.info("note 笔记 HTML 转换 MarkDown 失败，将保留原文件: " + repr(e))
 
         # 3、迁移文本文件里面的有道云笔记图片（链接）
         if file_type != FileType.OTHER or youdao_file_suffix == MARKDOWN_SUFFIX:
